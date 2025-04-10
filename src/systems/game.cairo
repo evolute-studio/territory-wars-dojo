@@ -69,6 +69,7 @@ pub mod game {
     use dojo::model::{ModelStorage, Model};
 
     use core::starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use core::dict::Felt252Dict;
 
     #[storage]
     struct Storage {
@@ -147,20 +148,9 @@ pub mod game {
             let player = get_caller_address();
 
             let board: Board = world.read_model(board_id);
-            let (_, _, joker_number1) = board.player1;
-            let (_, _, joker_number2) = board.player2;
-            let is_top_tipe = if board.top_tile.is_some() {
-                1
-            } else {
-                0
-            };
-            let max_move_number: u32 = 70
-                - board.available_tiles_in_deck.len()
-                - is_top_tipe
-                - joker_number1.into()
-                - joker_number2.into();
+            let max_move_number = board.moves_done;
 
-            if move_number.into() > max_move_number {
+            if move_number > max_move_number {
                 world
                     .emit_event(
                         @SnapshotCreateFailed {
@@ -189,6 +179,8 @@ pub mod game {
             let snapshot: Snapshot = world.read_model(snapshot_id);
             let board_id = snapshot.board_id;
             let move_number = snapshot.move_number;
+
+            println!("Move number: {:?}", move_number);
 
             let mut game: Game = world.read_model(host_player);
             let mut status = game.status;
@@ -302,6 +294,13 @@ pub mod game {
                         selector!("player2"),
                         board.player2,
                     );
+                
+                world
+                    .write_member(
+                        Model::<Board>::ptr_from_keys(board.id),
+                        selector!("last_update_timestamp"),
+                        get_block_timestamp(),
+                    );
 
                 board_id
             };
@@ -360,8 +359,8 @@ pub mod game {
                 let prev_move: Move = world.read_model(prev_move_id);
                 let prev_player_side = prev_move.player_side;
                 let time = get_block_timestamp();
-                let prev_move_time = prev_move.timestamp;
-                let time_delta = time - prev_move_time;
+                let last_update_timestamp = board.last_update_timestamp;
+                let time_delta = time - last_update_timestamp;
 
                 if player_side == prev_player_side {    
                     if time_delta > MOVE_TIME {
@@ -409,7 +408,7 @@ pub mod game {
                 timestamp: get_block_timestamp(),
             };
 
-            //TODO: revert invalid move when it's stable
+            // TODO: revert invalid move when it's stable
             if !is_valid_move(
                 tile, rotation, col, row, board.state.span(), board.initial_edge_state.span(),
             ) {
@@ -455,6 +454,7 @@ pub mod game {
                 board.red_score = (old_city_points + city_points, old_road_points + road_points);
             }
 
+            let mut visited: Felt252Dict<bool> = Default::default();
             let tile_position = (col * 8 + row).into();
             connect_city_edges_in_tile(
                 ref world, board_id, tile_position, tile.into(), rotation, player_side.into(),
@@ -462,12 +462,13 @@ pub mod game {
             let city_contest_scoring_result = connect_adjacent_city_edges(
                 ref world,
                 board_id,
-                board.state.clone(),
-                board.initial_edge_state.clone(),
+                ref board.state,
+                ref board.initial_edge_state,
                 tile_position,
                 tile.into(),
                 rotation,
                 player_side.into(),
+                ref visited,
             );
 
             if city_contest_scoring_result.is_some() {
@@ -492,12 +493,13 @@ pub mod game {
             let road_contest_scoring_results = connect_adjacent_road_edges(
                 ref world,
                 board_id,
-                board.state.clone(),
-                board.initial_edge_state.clone(),
+                ref board.state,
+                ref board.initial_edge_state,
                 tile_position,
                 tile.into(),
                 rotation,
                 player_side.into(),
+                ref visited,
             );
 
             for i in 0..road_contest_scoring_results.len() {
@@ -529,6 +531,7 @@ pub mod game {
             );
 
             board.last_move_id = Option::Some(move_id);
+            board.moves_done = board.moves_done + 1;    
             self.move_id_generator.write(move_id + 1);
 
             if top_tile.is_none() && joker_number1 == 0 && joker_number2 == 0 {
@@ -591,8 +594,22 @@ pub mod game {
             world
                 .write_member(
                     Model::<Board>::ptr_from_keys(board_id),
+                    selector!("moves_done"),
+                    board.moves_done,
+                );
+
+            world
+                .write_member(
+                    Model::<Board>::ptr_from_keys(board_id),
                     selector!("game_state"),
                     board.game_state,
+                );
+
+            world
+                .write_member(
+                    Model::<Board>::ptr_from_keys(board_id),
+                    selector!("last_update_timestamp"),
+                    get_block_timestamp(),
                 );
 
             world
@@ -622,6 +639,7 @@ pub mod game {
                         blue_score: board.blue_score,
                         red_score: board.red_score,
                         last_move_id: board.last_move_id,
+                        moves_done: board.moves_done,
                         game_state: board.game_state,
                     },
                 );
@@ -665,8 +683,8 @@ pub mod game {
                 let prev_player_side = prev_move.player_side;
                 
                 let time = get_block_timestamp();
-                let prev_move_time = prev_move.timestamp;
-                let time_delta = time - prev_move_time;
+                let last_update_timestamp = board.last_update_timestamp;
+                let time_delta = time - last_update_timestamp;
 
                 if player_side == prev_player_side {    
                     if time_delta > MOVE_TIME {
@@ -728,9 +746,9 @@ pub mod game {
                 return;
             }
 
-            let last_move: Move = world.read_model(board.last_move_id.unwrap());
+            let last_update_timestamp = board.last_update_timestamp;
             let timestamp = get_block_timestamp();
-            let time_delta = timestamp - last_move.timestamp;
+            let time_delta = timestamp - last_update_timestamp;
             if time_delta > 2 * MOVE_TIME {
                 //FINISH THE GAME
                 self._finish_game(ref board);
@@ -773,6 +791,7 @@ pub mod game {
 
 
             board.last_move_id = Option::Some(move_id);
+            board.moves_done = board.moves_done + 1;
             move_id_generator.write(move_id + 1);
 
             world.write_model(@move);
@@ -782,6 +801,20 @@ pub mod game {
                     Model::<Board>::ptr_from_keys(board_id),
                     selector!("last_move_id"),
                     board.last_move_id,
+                );
+            
+            world
+                .write_member(
+                    Model::<Board>::ptr_from_keys(board_id),
+                    selector!("last_update_timestamp"),
+                    get_block_timestamp(),
+                );
+
+            world
+                .write_member(
+                    Model::<Board>::ptr_from_keys(board_id),
+                    selector!("moves_done"),
+                    board.moves_done,
                 );
 
             world
@@ -798,6 +831,7 @@ pub mod game {
                         blue_score: board.blue_score,
                         red_score: board.red_score,
                         last_move_id: board.last_move_id,
+                        moves_done: board.moves_done,
                         game_state: board.game_state,
                     },
                 );
@@ -936,6 +970,14 @@ pub mod game {
                     selector!("game_state"),
                     board.game_state,
                 );
+            
+            world
+                .write_member(
+                    Model::<Board>::ptr_from_keys(board.id),
+                    selector!("last_update_timestamp"),
+                    get_block_timestamp(),
+                );
+
             world
                 .emit_event(
                     @BoardUpdated {
@@ -948,6 +990,7 @@ pub mod game {
                         blue_score: board.blue_score,
                         red_score: board.red_score,
                         last_move_id: board.last_move_id,
+                        moves_done: board.moves_done,
                         game_state: board.game_state,
                     },
                 );
